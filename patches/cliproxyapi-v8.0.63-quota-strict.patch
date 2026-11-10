@@ -992,6 +992,75 @@ index 24c7656..f789585 100644
  	if !res.Success && (s.rebindOnNever || (s.rebindOnQuotaOnly && !shouldRebindSessionAffinityOnError(res.Error))) {
  		// Under session-affinity-rebind-on: never (or quota on transient failures),
  		// keep the session bound to its original credential.
+diff --git a/sdk/cliproxy/auth/selector_test.go b/sdk/cliproxy/auth/selector_test.go
+index 3767868..f9a720c 100644
+--- a/sdk/cliproxy/auth/selector_test.go
++++ b/sdk/cliproxy/auth/selector_test.go
+@@ -2040,38 +2040,34 @@ func TestSessionAffinitySelector_CrossProviderIsolation(t *testing.T) {
+ 
+ func TestSessionCache_GetAndRefresh(t *testing.T) {
+ 	t.Parallel()
+-
+-	cache := NewSessionCache(100 * time.Millisecond)
++	cache := NewSessionCache(time.Hour)
+ 	defer cache.Stop()
+-
+ 	cache.Set("session1", "auth1")
+-
+-	// Verify initial value
+-	got, ok := cache.GetAndRefresh("session1")
+-	if !ok || got != "auth1" {
+-		t.Fatalf("GetAndRefresh() = %q, %v, want auth1, true", got, ok)
+-	}
+-
+-	// Wait half TTL and access again (should refresh)
+-	time.Sleep(60 * time.Millisecond)
+-	got, ok = cache.GetAndRefresh("session1")
+-	if !ok || got != "auth1" {
+-		t.Fatalf("GetAndRefresh() after 60ms = %q, %v, want auth1, true", got, ok)
+-	}
+-
+-	// Wait another 60ms (total 120ms from original, but TTL refreshed at 60ms)
+-	// Entry should still be valid because TTL was refreshed
+-	time.Sleep(60 * time.Millisecond)
+-	got, ok = cache.GetAndRefresh("session1")
+-	if !ok || got != "auth1" {
+-		t.Fatalf("GetAndRefresh() after refresh = %q, %v, want auth1, true (TTL should have been refreshed)", got, ok)
+-	}
+-
+-	// Now wait full TTL without access
+-	time.Sleep(110 * time.Millisecond)
+-	got, ok = cache.GetAndRefresh("session1")
+-	if ok {
+-		t.Fatalf("GetAndRefresh() after expiry = %q, %v, want '', false", got, ok)
++	// Set fixture deadlines explicitly. Sleep-based sub-second TTL assertions
++	// measure runner scheduling rather than GetAndRefresh behavior.
++	setDeadline := func(deadline time.Time) {
++		cache.mu.Lock()
++		defer cache.mu.Unlock()
++		old := cache.entries["session1"]
++		cache.replaceAliasGroupsLocked(old.authID, deadline, old.aliases, old.binding, old)
++	}
++	for i := 0; i < 2; i++ {
++		deadline := time.Now().Add(20 * time.Minute)
++		setDeadline(deadline)
++		got, ok := cache.GetAndRefresh("session1")
++		if !ok || got != "auth1" {
++			t.Fatalf("refresh %d = %q, %v", i, got, ok)
++		}
++		cache.mu.RLock()
++		refreshed := cache.entries["session1"].expiresAt
++		cache.mu.RUnlock()
++		if !refreshed.After(deadline.Add(30 * time.Minute)) {
++			t.Fatal("GetAndRefresh did not renew TTL")
++		}
++	}
++	setDeadline(time.Now().Add(-time.Hour))
++	if got, ok := cache.GetAndRefresh("session1"); ok || got != "" {
++		t.Fatalf("expired binding resurrected: %q %v", got, ok)
+ 	}
+ }
+ 
 diff --git a/sdk/cliproxy/proxcli_state_test.go b/sdk/cliproxy/proxcli_state_test.go
 new file mode 100644
 index 0000000..4cfb37a
