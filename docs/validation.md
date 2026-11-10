@@ -36,3 +36,5 @@ go test ./internal/hub -run TestCLIProxyAPIIntegration -count=1 -v
 Реальные OAuth code exchange, refresh, inference, фактический IP прокси и provider-specific ограничения требуют собственных аккаунтов и рабочего прокси. Эти действия с личными аккаунтами не выполнялись. Contract test использует синтетический auth-файл с недействительным токеном и отдельный временный каталог; OAuth URL только создаётся, но не открывается.
 
 Affinity остаётся в памяти работающего ядра. Тесты не подтверждают восстановление диалогов после его перезапуска; такой возможности пока нет. Observer — best-effort, а не биллинговый журнал exactly-once.
+
+На Intel macOS loader-проверка использует `TestProxCliUsageNativeThreadLifecycle`: init/call/free/shutdown, замена библиотеки и повторное открытие того же образа через изолированный путь `proxcli-usage`. Штатные тесты с другими Go-плагинами вызывают известный конфликт Go runtime на этой платформе и не входят в этот target. На остальных платформах запускается весь набор Unix/Windows loader tests. Contract test с настоящим ядром и observer обязателен на каждой платформе.

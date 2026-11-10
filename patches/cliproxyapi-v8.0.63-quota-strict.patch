@@ -166,6 +166,40 @@ index 1489bc8..11c8149 100644
  		c.api.shutdown = nil
  	}
  	c.api.call = nil
+diff --git a/internal/pluginhost/loader_unix_test.go b/internal/pluginhost/loader_unix_test.go
+index 160636c..07c7684 100644
+--- a/internal/pluginhost/loader_unix_test.go
++++ b/internal/pluginhost/loader_unix_test.go
+@@ -47,16 +47,27 @@ func buildReloadTestPlugin(t *testing.T, version int, outPath string) {
+ }
+ 
+ func TestUnixPluginReloadAfterShutdownUsesReplacedFile(t *testing.T) {
++	testUnixPluginReload(t, "alpha")
++}
++
++// Exercise ProxCli's callback-free Go observer calling path, including the
++// darwin/amd64 native-thread boundary, replacement and same-image reload.
++func TestProxCliUsageNativeThreadLifecycle(t *testing.T) {
++	testUnixPluginReload(t, "proxcli-usage")
++}
++
++func testUnixPluginReload(t *testing.T, pluginID string) {
++	t.Helper()
+ 	dir := t.TempDir()
+ 	ext := ".so"
+ 	if runtime.GOOS == "darwin" {
+ 		ext = ".dylib"
+ 	}
+-	pluginPath := filepath.Join(dir, "alpha"+ext)
++	pluginPath := filepath.Join(dir, pluginID+ext)
+ 	buildReloadTestPlugin(t, 1, pluginPath)
+ 
+ 	host := New()
+-	file := pluginFile{ID: "alpha", Path: pluginPath, Version: "1"}
++	file := pluginFile{ID: pluginID, Path: pluginPath, Version: "1"}
+ 	client, errOpen := dynamicLibraryLoader{}.Open(file, host)
+ 	if errOpen != nil {
+ 		t.Fatalf("Open() v1 error = %v", errOpen)
 diff --git a/sdk/cliproxy/auth/conductor_selection.go b/sdk/cliproxy/auth/conductor_selection.go
 index cd37a04..be1e79b 100644
 --- a/sdk/cliproxy/auth/conductor_selection.go
