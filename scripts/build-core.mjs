@@ -18,6 +18,7 @@ try {
   await run(['git', 'apply', resolve('patches/cliproxyapi-v8.0.63-quota-strict.patch')], source)
   await run(['go', 'test', './sdk/cliproxy/auth', '-count=1'], source)
   await run(['go', 'test', './sdk/cliproxy', '-run', 'TestServiceApplyConfigRuntimeSessionAffinityRebindOnChangeRecreatesSelector', '-count=1'], source)
+  await run(['go', 'test', './internal/pluginhost', '-run', 'Test(Unix|Windows|LimitedProbe)', '-count=1'], source)
   await mkdir(join(root, 'bin/plugins'), { recursive: true })
   await run(['go', 'build', '-trimpath', '-o', join(root, `bin/cli-proxy-api${exe}`), './cmd/server'], source)
   const extension = process.platform === 'darwin' ? 'dylib' : process.platform === 'win32' ? 'dll' : 'so'

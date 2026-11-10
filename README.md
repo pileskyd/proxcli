@@ -24,7 +24,7 @@
 
 ## Отличия от CLIProxyAPI и гайда Theo
 
-ProxCli использует CLIProxyAPI v8.0.63, commit `6db7d4b839d86c5b24e17bbe73bcd4db18ef1b1a`. Перевод протоколов, OAuth, streaming, WebSocket, refresh и исполнение запросов остаются в ядре. Панель не стоит на пути inference.
+ProxCli использует CLIProxyAPI v8.0.63, commit `6db7d4b839d86c5b24e17bbe73bcd4db18ef1b1a`. Перевод протоколов, OAuth, streaming, WebSocket, refresh и исполнение запросов остаются в ядре. Панель не стоит на пути inference. Патч добавляет `quota-strict` и изоляцию вызовов observer на Intel macOS.
 
 | | CLIProxyAPI v8.0.63 | Подход Theo / T3 из гайда | ProxCli |
 | --- | --- | --- | --- |

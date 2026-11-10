@@ -12,6 +12,160 @@ index e73ad89..9920626 100644
  	v8.GET("/config", s.mgmt.ConfigV8)
  	v8.PUT("/config", s.mgmt.ConfigV8)
  	v8.PATCH("/config", s.mgmt.ConfigV8)
+diff --git a/internal/pluginhost/loader_unix.go b/internal/pluginhost/loader_unix.go
+index 1489bc8..11c8149 100644
+--- a/internal/pluginhost/loader_unix.go
++++ b/internal/pluginhost/loader_unix.go
+@@ -9,6 +9,9 @@ package pluginhost
+ #include <stdint.h>
+ #include <stdlib.h>
+ #include <unistd.h>
++#if defined(__APPLE__) && defined(__x86_64__)
++#include <pthread.h>
++#endif
+ 
+ typedef struct {
+ 	void* ptr;
+@@ -53,20 +56,74 @@ static const char* cliproxy_dlerror(void) {
+ 	return dlerror();
+ }
+ 
+-static int cliproxy_call_init(void* fn, const cliproxy_host_api* host, cliproxy_plugin_api* plugin) {
+-	return ((cliproxy_plugin_init_fn)fn)(host, plugin);
++// The two Go runtimes on darwin/amd64 share a TLS slot. ProxCli's
++// callback-free observer must enter its runtime on a fresh C-owned thread,
++// never on a thread belonging to the host Go runtime (golang/go#38692).
++// Other plugins retain the original calling path.
++typedef struct {
++	int operation;
++	void* fn;
++	const cliproxy_host_api* host;
++	cliproxy_plugin_api* plugin;
++	const char* method;
++	const uint8_t* request;
++	size_t request_len;
++	cliproxy_buffer* response;
++	void* ptr;
++	size_t len;
++	int rc;
++} proxcli_ffi_task;
++
++static void* proxcli_ffi_run(void* argument) {
++	proxcli_ffi_task* t = (proxcli_ffi_task*)argument;
++	switch (t->operation) {
++	case 0: t->rc = ((cliproxy_plugin_init_fn)t->fn)(t->host, t->plugin); break;
++	case 1: t->rc = ((cliproxy_plugin_call_fn)t->fn)(t->method, t->request, t->request_len, t->response); break;
++	case 2: ((cliproxy_plugin_free_fn)t->fn)(t->ptr, t->len); break;
++	case 3: ((cliproxy_plugin_shutdown_fn)t->fn)(); break;
++	}
++	return NULL;
+ }
+ 
+-static int cliproxy_call_plugin(cliproxy_plugin_call_fn fn, const char* method, const uint8_t* request, size_t request_len, cliproxy_buffer* response) {
+-	return fn(method, request, request_len, response);
++static int proxcli_ffi_dispatch(proxcli_ffi_task* task, int isolate) {
++#if defined(__APPLE__) && defined(__x86_64__)
++	if (isolate) {
++		pthread_t thread;
++		if (pthread_create(&thread, NULL, proxcli_ffi_run, task) != 0) return 1;
++		// Join before returning: task and output pointers belong to this call.
++		if (pthread_join(thread, NULL) != 0) abort();
++		return task->rc;
++	}
++#else
++	(void)isolate;
++#endif
++	proxcli_ffi_run(task);
++	return task->rc;
+ }
+ 
+-static void cliproxy_free_plugin_buffer(cliproxy_plugin_free_fn fn, void* ptr, size_t len) {
+-	fn(ptr, len);
++static int cliproxy_call_init(void* fn, const cliproxy_host_api* host, cliproxy_plugin_api* plugin, int isolate) {
++	proxcli_ffi_task task = {0};
++	task.fn = fn; task.host = host; task.plugin = plugin;
++	return proxcli_ffi_dispatch(&task, isolate);
+ }
+ 
+-static void cliproxy_shutdown_plugin(cliproxy_plugin_shutdown_fn fn) {
+-	fn();
++static int cliproxy_call_plugin(cliproxy_plugin_call_fn fn, const char* method, const uint8_t* request, size_t request_len, cliproxy_buffer* response, int isolate) {
++	proxcli_ffi_task task = {0};
++	task.operation = 1; task.fn = (void*)fn; task.method = method;
++	task.request = request; task.request_len = request_len; task.response = response;
++	return proxcli_ffi_dispatch(&task, isolate);
++}
++
++static void cliproxy_free_plugin_buffer(cliproxy_plugin_free_fn fn, void* ptr, size_t len, int isolate) {
++	proxcli_ffi_task task = {0};
++	task.operation = 2; task.fn = (void*)fn; task.ptr = ptr; task.len = len;
++	(void)proxcli_ffi_dispatch(&task, isolate);
++}
++
++static void cliproxy_shutdown_plugin(cliproxy_plugin_shutdown_fn fn, int isolate) {
++	proxcli_ffi_task task = {0};
++	task.operation = 3; task.fn = (void*)fn;
++	(void)proxcli_ffi_dispatch(&task, isolate);
+ }
+ 
+ static void cliproxy_set_host_api(cliproxy_host_api* api, uint32_t abi_version, void* host_ctx) {
+@@ -100,9 +157,9 @@ static int cliproxy_probe_init_and_shutdown(void* fn, uint32_t abi_version) {
+ 	host_api.host_ctx = NULL;
+ 	host_api.call = cliproxy_probe_host_call;
+ 	host_api.free_buffer = cliproxy_probe_host_free;
+-	int rc = ((cliproxy_plugin_init_fn)fn)(&host_api, &plugin_api);
++	int rc = cliproxy_call_init(fn, &host_api, &plugin_api, 1);
+ 	if (rc == 0 && plugin_api.shutdown != NULL) {
+-		plugin_api.shutdown();
++		cliproxy_shutdown_plugin(plugin_api.shutdown, 1);
+ 	}
+ 	return rc;
+ }
+@@ -167,6 +224,7 @@ type dynamicLibraryClient struct {
+ 	hostAPI  *C.cliproxy_host_api
+ 	hostCtx  unsafe.Pointer
+ 	api      C.cliproxy_plugin_api
++	isolate  C.int
+ 	host     *Host
+ 	pluginID string
+ 	instance *hostCallbackInstance
+@@ -222,7 +280,10 @@ func (dynamicLibraryLoader) Open(file pluginFile, host *Host) (pluginClient, err
+ 		pluginID: file.ID,
+ 		instance: instance,
+ 	}
+-	rc := C.cliproxy_call_init(initSymbol, hostAPI, &client.api)
++	if file.ID == "proxcli-usage" {
++		client.isolate = 1
++	}
++	rc := C.cliproxy_call_init(initSymbol, hostAPI, &client.api, client.isolate)
+ 	if rc != 0 {
+ 		client.closeAfterOpenFailure()
+ 		return nil, fmt.Errorf("cliproxy_plugin_init returned %d", int(rc))
+@@ -265,13 +326,13 @@ func (c *dynamicLibraryClient) Call(ctx context.Context, method string, request
+ 		defer C.free(cRequest)
+ 	}
+ 	var response C.cliproxy_buffer
+-	rc := C.cliproxy_call_plugin(c.api.call, cMethod, (*C.uint8_t)(cRequest), C.size_t(len(request)), &response)
++	rc := C.cliproxy_call_plugin(c.api.call, cMethod, (*C.uint8_t)(cRequest), C.size_t(len(request)), &response, c.isolate)
+ 	var out []byte
+ 	if response.ptr != nil && response.len > 0 {
+ 		out = C.GoBytes(response.ptr, C.int(response.len))
+ 	}
+ 	if response.ptr != nil {
+-		C.cliproxy_free_plugin_buffer(c.api.free_buffer, response.ptr, response.len)
++		C.cliproxy_free_plugin_buffer(c.api.free_buffer, response.ptr, response.len, c.isolate)
+ 	}
+ 	if rc != 0 {
+ 		if isPluginErrorEnvelope(out) {
+@@ -307,7 +368,7 @@ func (c *dynamicLibraryClient) close() {
+ 		c.host = nil
+ 	}
+ 	if c.api.shutdown != nil {
+-		C.cliproxy_shutdown_plugin(c.api.shutdown)
++		C.cliproxy_shutdown_plugin(c.api.shutdown, c.isolate)
+ 		c.api.shutdown = nil
+ 	}
+ 	c.api.call = nil
 diff --git a/sdk/cliproxy/auth/conductor_selection.go b/sdk/cliproxy/auth/conductor_selection.go
 index cd37a04..be1e79b 100644
 --- a/sdk/cliproxy/auth/conductor_selection.go

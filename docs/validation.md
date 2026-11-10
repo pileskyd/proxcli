@@ -5,7 +5,7 @@
 ## Автоматические проверки
 
 - `bun run check`: Go tests с race detector, `go vet`, 8 frontend tests, Vue typecheck и Vite production build — успешно.
-- `bun run build:core`: точный upstream `6db7d4b839d86c5b24e17bbe73bcd4db18ef1b1a`, проверка применимости патча, полный auth test suite, SDK routing config test, сборка core и observer — успешно.
+- `bun run build:core`: точный upstream `6db7d4b839d86c5b24e17bbe73bcd4db18ef1b1a`, проверка применимости патча, полный auth test suite, SDK routing config test, native loader tests, сборка core и observer — успешно.
 - `TestProxCliQuotaStrict` внутри патча: explicit и LCP, подтверждённая квота, 5xx, сеть, 401/403, обычный rate limit, сохранение нового binding после восстановления более приоритетного аккаунта.
 - `scripts/test-plugin.py`: реальная C ABI регистрация, init→shutdown без register, register→usage→shutdown→register→usage, запись cache counters и отсутствие исходных секретов — успешно.
 - Тесты нормализации отдельно проверяют, что Claude cache creation не считается чтением и что у Codex cached subset вычитается из input.
@@ -22,6 +22,8 @@ PROXCLI_TEST_PLUGIN="$PWD/bin/plugins/proxcli-usage.dylib" \
 PROXCLI_TEST_POLICY=true \
 go test ./internal/hub -run TestCLIProxyAPIIntegration -count=1 -v
 ```
+
+- Исправление Intel macOS воспроизведено на минимальном Go→C ABI хосте. После изоляции C-потоков настоящий x86-64 CLIProxyAPI + observer прошёл contract test локально под Rosetta с race detector у панели. Native runner macOS Intel проверяется перед публикацией релиза.
 
 ## Проверка UI
 

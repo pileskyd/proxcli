@@ -72,7 +72,7 @@ func TestCLIProxyAPIIntegration(t *testing.T) {
 			log = strings.ReplaceAll(log, value, "[redacted]")
 		}
 		if len(log) > 8192 {
-			log = log[len(log)-8192:]
+			log = log[:4096] + "\n... startup log truncated ...\n" + log[len(log)-4096:]
 		}
 		t.Fatalf("%s; process: %v\n%s", reason, exitErr, log)
 	}
