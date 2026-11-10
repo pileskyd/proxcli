@@ -1,0 +1,26 @@
+# CLIProxyAPI v8. Для рабочего конфига со случайными ключами: bun run init
+config-version: 8
+server:
+  host: "127.0.0.1"
+  port: 8317
+management:
+  allow-remote: false
+  secret-key: "REPLACE_WITH_MANAGEMENT_KEY"
+  disable-control-panel: true
+access:
+  api-keys: ["REPLACE_WITH_CLIENT_KEY"]
+oauth:
+  auth-dir: "~/.cli-proxy-api"
+routing:
+  strategy: "fill-first"
+  session-affinity: true
+  session-affinity-ttl: "168h"
+  session-affinity-rebind-on: "quota-strict"
+plugins:
+  enabled: true
+  dir: "bin/plugins"
+  configs:
+    proxcli-usage:
+      enabled: true
+requests:
+  proxy-url: ""

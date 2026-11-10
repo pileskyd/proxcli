@@ -1,0 +1,17 @@
+{
+  "name": "proxcli",
+  "version": "0.2.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "init": "bun scripts/init.mjs",
+    "dev": "bun scripts/dev.mjs",
+    "build": "bun scripts/build.mjs",
+    "start": "bun scripts/start.mjs",
+    "hub": "bun scripts/hub.mjs",
+    "check": "bun scripts/check.mjs",
+    "build:core": "bun scripts/build-core.mjs",
+    "package": "bun scripts/package-release.mjs",
+    "demo": "bun scripts/demo.mjs"
+  }
+}

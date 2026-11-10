@@ -1,0 +1,119 @@
+name: Release
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Release version
+        required: true
+        default: v0.2.0
+        type: string
+      publish:
+        description: Publish after all native tests pass
+        default: false
+        type: boolean
+permissions:
+  contents: read
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+jobs:
+  build:
+    name: ${{ matrix.platform }}-${{ matrix.arch }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15
+            platform: macos
+            arch: arm64
+          - runner: macos-15-intel
+            platform: macos
+            arch: amd64
+          - runner: ubuntu-24.04
+            platform: linux
+            arch: amd64
+          - runner: ubuntu-24.04-arm
+            platform: linux
+            arch: arm64
+          - runner: windows-2025
+            platform: windows
+            arch: amd64
+    runs-on: ${{ matrix.runner }}
+    defaults:
+      run:
+        shell: bash
+    env:
+      CGO_ENABLED: '1'
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version: '1.27.3'
+          cache: false
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with:
+          bun-version: latest
+      - name: Check panel and observer
+        run: bun run check
+      - name: Build pinned core and observer
+        run: bun run build:core
+      - name: Verify native plugin lifecycle and sanitization
+        run: |
+          if [ "$RUNNER_OS" = Windows ]; then
+            python scripts/test-plugin.py bin/plugins/proxcli-usage.dll
+          elif [ "$RUNNER_OS" = macOS ]; then
+            python3 scripts/test-plugin.py bin/plugins/proxcli-usage.dylib
+          else
+            python3 scripts/test-plugin.py bin/plugins/proxcli-usage.so
+          fi
+      - name: Check real core integration
+        run: |
+          if [ "$RUNNER_OS" = Windows ]; then
+            export PROXCLI_TEST_CORE="$PWD/bin/cli-proxy-api.exe"
+            export PROXCLI_TEST_PLUGIN="$PWD/bin/plugins/proxcli-usage.dll"
+          elif [ "$RUNNER_OS" = macOS ]; then
+            export PROXCLI_TEST_CORE="$PWD/bin/cli-proxy-api"
+            export PROXCLI_TEST_PLUGIN="$PWD/bin/plugins/proxcli-usage.dylib"
+          else
+            export PROXCLI_TEST_CORE="$PWD/bin/cli-proxy-api"
+            export PROXCLI_TEST_PLUGIN="$PWD/bin/plugins/proxcli-usage.so"
+          fi
+          PROXCLI_TEST_POLICY=true go test ./internal/hub -run TestCLIProxyAPIIntegration -count=1 -v
+      - name: Package allowlisted files
+        env:
+          PROXCLI_VERSION: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || inputs.version || 'v0.2.0-dev' }}
+        run: bun run package
+      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: proxcli-${{ matrix.platform }}-${{ matrix.arch }}
+          path: dist-release/*
+          if-no-files-found: error
+          retention-days: 7
+  publish:
+    if: startsWith(github.ref, 'refs/tags/') || inputs.publish == true
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+        with:
+          pattern: proxcli-*
+          merge-multiple: true
+          path: dist-release
+      - name: Publish tested packages
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || inputs.version }}
+        run: |
+          cd dist-release
+          sha256sum proxcli-*.tar.gz proxcli-*.zip > SHA256SUMS
+          cd ..
+          gh release create "$RELEASE_TAG" dist-release/*.tar.gz dist-release/*.zip dist-release/SHA256SUMS --target "$GITHUB_SHA" --title "ProxCli $RELEASE_TAG" --notes-file docs/releases/v0.2.0.md
