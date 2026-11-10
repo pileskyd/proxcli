@@ -11,6 +11,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"proxcli/internal/telemetry"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -53,34 +54,57 @@ func TestCLIProxyAPIIntegration(t *testing.T) {
 	cmd := exec.Command(binary, "-config", configPath)
 	cmd.Dir = dir
 	cmd.Env = append(os.Environ(), "HTTP_PROXY=", "HTTPS_PROXY=", "ALL_PROXY=", "http_proxy=", "https_proxy=", "all_proxy=", "PROXCLI_DATA_DIR="+filepath.Join(dir, "panel"))
-	// Do not surface upstream logs: OAuth URLs and credential details belong to the hub.
+	// Capture only this isolated fixture's startup; never print OAuth-flow logs.
+	var startup bytes.Buffer
+	cmd.Stdout, cmd.Stderr = &startup, &startup
 	if e = cmd.Start(); e != nil {
 		t.Fatal(e)
 	}
-	t.Cleanup(func() { _ = cmd.Process.Kill(); _ = cmd.Wait() })
+	exited := make(chan struct{})
+	var exitErr error
+	go func() { exitErr = cmd.Wait(); close(exited) }()
+	stopCore := func() { _ = cmd.Process.Kill(); <-exited }
+	t.Cleanup(stopCore)
+	startupFailed := func(reason string) {
+		stopCore() // Wait before reading the buffer, including on slow native runners.
+		log := regexp.MustCompile(`https?://[^\s"<>]+`).ReplaceAllString(startup.String(), "[URL redacted]")
+		for _, value := range []string{key, "integration-access", "not-a-real-token"} {
+			log = strings.ReplaceAll(log, value, "[redacted]")
+		}
+		if len(log) > 8192 {
+			log = log[len(log)-8192:]
+		}
+		t.Fatalf("%s; process: %v\n%s", reason, exitErr, log)
+	}
 	s, e := New(Config{Upstream: fmt.Sprintf("http://127.0.0.1:%d", port), ManagementKey: key, DataDir: filepath.Join(dir, "panel")})
 	if e != nil {
 		t.Fatal(e)
 	}
-	deadline := time.Now().Add(15 * time.Second)
+	deadline := time.Now().Add(60 * time.Second)
 	for {
+		select {
+		case <-exited:
+			startupFailed("core exited before readiness")
+		default:
+		}
 		w := call(t, s, "GET", "/api/status", "")
 		if strings.Contains(w.Body.String(), `"connected":true`) {
 			break
 		}
 		if time.Now().After(deadline) {
-			t.Fatalf("core did not become ready: %s", w.Body.String())
+			startupFailed("core did not become ready within 60s")
 		}
 		time.Sleep(100 * time.Millisecond)
 	}
 	var w *httptest.ResponseRecorder
+	deadline = time.Now().Add(30 * time.Second)
 	for {
 		w = call(t, s, "GET", "/api/subscriptions", "")
 		if bytes.Contains(w.Body.Bytes(), []byte("fixture.json")) {
 			break
 		}
 		if time.Now().After(deadline) {
-			t.Fatalf("credential not discovered: %s", w.Body.String())
+			startupFailed("fixture credential not discovered within 30s")
 		}
 		time.Sleep(100 * time.Millisecond)
 	}
