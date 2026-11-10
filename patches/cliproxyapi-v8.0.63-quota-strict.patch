@@ -298,15 +298,16 @@ index 0000000..41ebc37
 +}
 diff --git a/sdk/cliproxy/auth/proxcli_policy_test.go b/sdk/cliproxy/auth/proxcli_policy_test.go
 new file mode 100644
-index 0000000..5c7043f
+index 0000000..e114ba7
 --- /dev/null
 +++ b/sdk/cliproxy/auth/proxcli_policy_test.go
-@@ -0,0 +1,83 @@
+@@ -0,0 +1,93 @@
 +package auth
 +
 +import (
 +	"context"
 +	"net/http"
++	"path/filepath"
 +	"testing"
 +	"time"
 +
@@ -332,7 +333,8 @@ index 0000000..5c7043f
 +				id := t.Name()
 +				high, low := id+"-a", id+"-b"
 +				manager := NewManager(nil, nil, nil)
-+				affinity := NewSessionAffinitySelectorWithConfig(SessionAffinityConfig{Fallback: &FillFirstSelector{}, TTL: 24 * time.Hour, RebindOn: SessionAffinityRebindOnQuotaStrict})
++				statePath := filepath.Join(t.TempDir(), "affinity.enc")
++				affinity := NewSessionAffinitySelectorWithConfig(SessionAffinityConfig{StateFile: statePath, Fallback: &FillFirstSelector{}, TTL: 24 * time.Hour, RebindOn: SessionAffinityRebindOnQuotaStrict})
 +				defer affinity.Stop()
 +				manager.SetSelector(affinity)
 +				manager.RegisterExecutor(schedulerTestExecutor{provider: provider})
@@ -381,15 +383,436 @@ index 0000000..5c7043f
 +				if e != nil || a == nil || a.ID != want {
 +					t.Fatalf("recovery changed binding: auth=%v err=%v want=%s", a, e, want)
 +				}
++				restored := NewSessionAffinitySelectorWithConfig(SessionAffinityConfig{StateFile: statePath, Fallback: &FillFirstSelector{}, TTL: 24 * time.Hour, RebindOn: SessionAffinityRebindOnQuotaStrict})
++				manager.SetSelector(restored)
++				defer restored.Stop()
++				a, _, e = manager.pickNext(ctx, provider, model, makeOpts(), nil)
++				if e != nil || a == nil || a.ID != want {
++					t.Fatalf("restart lost quota policy binding: %v %v want %s", a, e, want)
++				}
++
 +			})
 +		}
 +	}
 +}
+diff --git a/sdk/cliproxy/auth/proxcli_state.go b/sdk/cliproxy/auth/proxcli_state.go
+new file mode 100644
+index 0000000..69fc30e
+--- /dev/null
++++ b/sdk/cliproxy/auth/proxcli_state.go
+@@ -0,0 +1,269 @@
++package auth
++
++import (
++	"context"
++	"crypto/aes"
++	"crypto/cipher"
++	"crypto/rand"
++	"encoding/json"
++	"errors"
++	"io"
++	"os"
++	"path/filepath"
++	"sync"
++	"time"
++
++	exec "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
++	session "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/session"
++	log "github.com/sirupsen/logrus"
++)
++
++type affinityDisk struct {
++	mu      sync.Mutex
++	path    string
++	key     []byte
++	loadErr error
++	stopped bool
++}
++type affinitySnapshot struct {
++	Version int
++	TTL     time.Duration
++	Cache   []DurableBinding
++	LCP     []session.DurablePrefixBinding
++}
++
++func affinityStorageError() error {
++	return &Error{Code: "session_affinity_storage_error", Message: "Cannot restore or persist session affinity; check the state file and key. No alternate account selected."}
++}
++func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model string, opts exec.Options, auths []*Auth) (*Auth, error) {
++	if s.disk == nil {
++		return s.pickMemory(ctx, provider, model, opts, auths)
++	}
++	d := s.disk
++	d.mu.Lock()
++	defer d.mu.Unlock()
++	if d.loadErr != nil || d.stopped {
++		return nil, affinityStorageError()
++	}
++	selected, err := s.pickMemory(ctx, provider, model, opts, auths)
++	if e := s.saveAffinity(); e != nil {
++		log.Error("proxcli: cannot persist session affinity")
++		return nil, affinityStorageError()
++	}
++	return selected, err
++}
++func (s *SessionAffinitySelector) OnResult(res Result) {
++	if s == nil {
++		return
++	}
++	if s.disk == nil {
++		s.onResultMemory(res)
++		return
++	}
++	d := s.disk
++	d.mu.Lock()
++	defer d.mu.Unlock()
++	if d.loadErr != nil || d.stopped {
++		return
++	}
++	s.onResultMemory(res)
++	if s.saveAffinity() != nil {
++		log.Error("proxcli: cannot persist session affinity result")
++	}
++}
++func (s *SessionAffinitySelector) initAffinity(path string, ttl time.Duration) {
++	if path == "" {
++		return
++	}
++	d := &affinityDisk{path: path}
++	s.disk = d
++	fail := func() {
++		d.loadErr = affinityStorageError()
++		log.Error("proxcli: cannot restore session affinity; requests will be refused")
++	}
++	data, e := os.ReadFile(path)
++	stateMissing := errors.Is(e, os.ErrNotExist)
++	if e != nil && !errors.Is(e, os.ErrNotExist) {
++		fail()
++		return
++	}
++	if (e == nil && len(data) == 0) || len(data) > 64<<20 {
++		fail()
++		return
++	}
++	key, e := os.ReadFile(path + ".key")
++	if errors.Is(e, os.ErrNotExist) && len(data) == 0 {
++		if e = os.MkdirAll(filepath.Dir(path), 0700); e != nil {
++			fail()
++			return
++		}
++		stateMissing = false
++		key = make([]byte, 32)
++		if _, e = rand.Read(key); e != nil {
++			fail()
++			return
++		}
++		f, err := os.OpenFile(path+".key", os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
++		if err != nil {
++			fail()
++			return
++		}
++		_, e = f.Write(key)
++		if e == nil {
++			e = f.Sync()
++		}
++		ce := f.Close()
++		if e != nil || ce != nil {
++			fail()
++			return
++		}
++	} else if e != nil {
++		fail()
++		return
++	}
++	if stateMissing && e == nil {
++		fail()
++		return
++	}
++	if len(key) != 32 {
++		fail()
++		return
++	}
++	d.key = key
++	if len(data) == 0 {
++		if s.saveAffinity() != nil {
++			fail()
++		}
++		return
++	}
++	block, _ := aes.NewCipher(key)
++	gcm, _ := cipher.NewGCM(block)
++	if len(data) < gcm.NonceSize() {
++		fail()
++		return
++	}
++	plain, e := gcm.Open(nil, data[:gcm.NonceSize()], data[gcm.NonceSize():], []byte("proxcli-affinity-v1"))
++	if e != nil {
++		fail()
++		return
++	}
++	var snapshot affinitySnapshot
++	if json.Unmarshal(plain, &snapshot) != nil || snapshot.Version != 1 {
++		fail()
++		return
++	}
++	// A shorter configured TTL is measured from the last persisted touch,
++	// never from this process's startup time.
++	if snapshot.TTL > 0 && ttl < snapshot.TTL {
++		for i := range snapshot.Cache {
++			snapshot.Cache[i].ExpiresAt = snapshot.Cache[i].ExpiresAt.Add(ttl - snapshot.TTL)
++		}
++		for i := range snapshot.LCP {
++			snapshot.LCP[i].ExpiresAt = snapshot.LCP[i].ExpiresAt.Add(ttl - snapshot.TTL)
++		}
++	}
++	s.cache.RestoreBindings(snapshot.Cache)
++	s.matcher.RestoreBindings(snapshot.LCP)
++}
++func (s *SessionAffinitySelector) saveAffinity() error {
++	d := s.disk
++	snapshot := affinitySnapshot{Version: 1, TTL: s.cache.ttl, Cache: s.cache.ExportBindings(), LCP: s.matcher.ExportBindings()}
++	plain, e := json.Marshal(snapshot)
++	if e != nil {
++		return e
++	}
++	block, e := aes.NewCipher(d.key)
++	if e != nil {
++		return e
++	}
++	gcm, e := cipher.NewGCM(block)
++	if e != nil {
++		return e
++	}
++	nonce := make([]byte, gcm.NonceSize())
++	if _, e = io.ReadFull(rand.Reader, nonce); e != nil {
++		return e
++	}
++	data := gcm.Seal(nonce, nonce, plain, []byte("proxcli-affinity-v1"))
++	if len(data) > 64<<20 {
++		return errors.New("affinity snapshot exceeds limit")
++	}
++	f, e := os.CreateTemp(filepath.Dir(d.path), ".affinity-*")
++	if e != nil {
++		return e
++	}
++	name := f.Name()
++	defer os.Remove(name)
++	if e = f.Chmod(0600); e == nil {
++		_, e = f.Write(data)
++	}
++	if e == nil {
++		e = f.Sync()
++	}
++	ce := f.Close()
++	if e == nil {
++		e = ce
++	}
++	if e != nil {
++		return e
++	}
++	if e = os.Rename(name, d.path); e != nil {
++		return e
++	}
++	// Persist the rename where directory fsync is supported (Windows does not support it).
++	if dir, err := os.Open(filepath.Dir(d.path)); err == nil {
++		_ = dir.Sync()
++		_ = dir.Close()
++	}
++	return nil
++}
++
++type DurableBinding struct {
++	AuthID              string
++	ExpiresAt           time.Time
++	Aliases             []string
++	SessionID, Provider string
++	Sequence            uint64
++}
++
++func (c *SessionCache) ExportBindings() []DurableBinding {
++	c.mu.RLock()
++	defer c.mu.RUnlock()
++	out := []DurableBinding{}
++	for el := c.evictionOrder.Front(); el != nil; el = el.Next() {
++		g, ok := c.groups[el.Value.(string)]
++		if ok && time.Now().Before(g.expiresAt) {
++			out = append(out, DurableBinding{g.authID, g.expiresAt, append([]string(nil), g.aliases...), g.binding.sessionID, g.binding.provider, g.binding.sequence})
++		}
++	}
++	return out
++}
++func (c *SessionCache) RestoreBindings(items []DurableBinding) {
++	c.mu.Lock()
++	defer c.mu.Unlock()
++	c.ensureInitializedLocked()
++	now := time.Now()
++	for _, g := range items {
++		if g.AuthID == "" || !now.Before(g.ExpiresAt) {
++			continue
++		}
++		aliases := compactSessionAliases(mergeSessionAliases(nil, g.Aliases...))
++		if len(aliases) == 0 {
++			continue
++		}
++		expiry := g.ExpiresAt
++		if limit := now.Add(c.ttl); expiry.After(limit) {
++			expiry = limit
++		}
++		previous := []sessionEntry{}
++		for _, a := range aliases {
++			if old, ok := c.entries[a]; ok {
++				previous = append(previous, old)
++			}
++		}
++		c.replaceAliasGroupsLocked(g.AuthID, expiry, aliases, sessionBinding{g.SessionID, g.Provider, g.Sequence}, previous...)
++		if g.Sequence > c.bindingSequence {
++			c.bindingSequence = g.Sequence
++		}
++	}
++}
+diff --git a/sdk/cliproxy/auth/proxcli_state_test.go b/sdk/cliproxy/auth/proxcli_state_test.go
+new file mode 100644
+index 0000000..9d58984
+--- /dev/null
++++ b/sdk/cliproxy/auth/proxcli_state_test.go
+@@ -0,0 +1,132 @@
++package auth
++
++import (
++	"bytes"
++	"context"
++	executor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
++	translator "github.com/router-for-me/CLIProxyAPI/v8/sdk/translator"
++	"net/http"
++	"os"
++	"os/exec"
++	"path/filepath"
++	"runtime"
++	"testing"
++	"time"
++)
++
++func durableOpts(lcp, grown bool) executor.Options {
++	o := executor.Options{Metadata: map[string]any{executor.CallerScopeMetadataKey: "caller"}}
++	if !lcp {
++		o.Headers = http.Header{"Session_id": []string{"private-session"}}
++		return o
++	}
++	o.SourceFormat = translator.FormatOpenAI
++	if grown {
++		o.OriginalRequest = []byte(`{"messages":[{"role":"system","content":"stable"},{"role":"user","content":"private-first"},{"role":"assistant","content":"answer"},{"role":"user","content":"continue"}]}`)
++	} else {
++		o.OriginalRequest = []byte(`{"messages":[{"role":"system","content":"stable"},{"role":"user","content":"private-first"}]}`)
++	}
++	return o
++}
++func TestProxCliDurableProcessRestart(t *testing.T) {
++	if path := os.Getenv("PROXCLI_TEST_AFFINITY_STATE"); path != "" {
++		lcp := os.Getenv("PROXCLI_TEST_AFFINITY_MODE") == "lcp"
++		read := os.Getenv("PROXCLI_TEST_AFFINITY_STAGE") == "read"
++		var fallback Selector = lastAuthSelector{}
++		if read {
++			fallback = &FillFirstSelector{}
++		}
++		s := NewSessionAffinitySelectorWithConfig(SessionAffinityConfig{Fallback: fallback, TTL: time.Hour, StateFile: path, RebindOn: SessionAffinityRebindOnQuotaStrict})
++		a, e := s.Pick(context.Background(), "openai", "model", durableOpts(lcp, read), []*Auth{{ID: "auth-a"}, {ID: "auth-b"}})
++		if e != nil || a == nil || a.ID != "auth-b" {
++			t.Fatalf("restart changed account: %v %v", a, e)
++		}
++		// Exit without Stop: durability cannot depend on graceful shutdown.
++		return
++	}
++	for _, mode := range []string{"explicit", "lcp"} {
++		t.Run(mode, func(t *testing.T) {
++			path := filepath.Join(t.TempDir(), "affinity.enc")
++			for _, stage := range []string{"write", "read"} {
++				cmd := exec.Command(os.Args[0], "-test.run=^TestProxCliDurableProcessRestart$")
++				cmd.Env = append(os.Environ(), "PROXCLI_TEST_AFFINITY_STATE="+path, "PROXCLI_TEST_AFFINITY_MODE="+mode, "PROXCLI_TEST_AFFINITY_STAGE="+stage)
++				if out, e := cmd.CombinedOutput(); e != nil {
++					t.Fatalf("%s: %v %s", stage, e, out)
++				}
++			}
++			raw, _ := os.ReadFile(path)
++			if bytes.Contains(raw, []byte("private-first")) || bytes.Contains(raw, []byte("private-session")) {
++				t.Fatal("plaintext persisted")
++			}
++			if runtime.GOOS != "windows" {
++				for _, p := range []string{path, path + ".key"} {
++					info, _ := os.Stat(p)
++					if info.Mode().Perm() != 0600 {
++						t.Fatal("unsafe file mode")
++					}
++				}
++			}
++		})
++	}
++}
++func TestProxCliDurableCorruptionAndWriteFailure(t *testing.T) {
++	for _, kind := range []string{"corrupt", "empty", "missing-key", "missing-state", "wrong-key", "unwritable"} {
++		t.Run(kind, func(t *testing.T) {
++			path := filepath.Join(t.TempDir(), "affinity.enc")
++			cfg := SessionAffinityConfig{TTL: time.Hour, StateFile: path, RebindOn: SessionAffinityRebindOnQuotaStrict}
++			s := NewSessionAffinitySelectorWithConfig(cfg)
++			s.Stop()
++			switch kind {
++			case "corrupt":
++				os.WriteFile(path, []byte("bad"), 0600)
++			case "empty":
++				os.WriteFile(path, nil, 0600)
++			case "missing-state":
++				os.Remove(path)
++			case "missing-key":
++				os.Remove(path + ".key")
++			case "wrong-key":
++				os.WriteFile(path+".key", make([]byte, 32), 0600)
++			}
++			s = NewSessionAffinitySelectorWithConfig(cfg)
++			defer s.Stop()
++			if kind == "unwritable" {
++				os.Remove(path)
++				os.Mkdir(path, 0700)
++			}
++			a, e := s.Pick(context.Background(), "openai", "model", durableOpts(false, false), []*Auth{{ID: "a"}})
++			if a != nil || e == nil {
++				t.Fatal("storage failure selected an account")
++			}
++		})
++	}
++}
++func TestProxCliDurableExpiryAndInvalidation(t *testing.T) {
++	path := filepath.Join(t.TempDir(), "affinity.enc")
++	cfg := SessionAffinityConfig{TTL: time.Hour, StateFile: path, Fallback: lastAuthSelector{}}
++	s := NewSessionAffinitySelectorWithConfig(cfg)
++	opts := durableOpts(false, false)
++	auths := []*Auth{{ID: "a"}, {ID: "b"}}
++	if _, e := s.Pick(context.Background(), "openai", "model", opts, auths); e != nil {
++		t.Fatal(e)
++	}
++	s.InvalidateAuth("b")
++	s.Stop()
++	cfg.Fallback = &FillFirstSelector{}
++	s = NewSessionAffinitySelectorWithConfig(cfg)
++	a, e := s.Pick(context.Background(), "openai", "model", durableOpts(false, false), auths)
++	if e != nil || a.ID != "a" {
++		t.Fatal("deleted binding resurrected")
++	}
++	s.Stop()
++	// Absolute expiration must include downtime, rather than starting a new TTL at load.
++	cfg.TTL = time.Millisecond
++	s = NewSessionAffinitySelectorWithConfig(cfg)
++	s.Stop()
++	time.Sleep(20 * time.Millisecond)
++	s = NewSessionAffinitySelectorWithConfig(cfg)
++	defer s.Stop()
++	if got := s.cache.ExportBindings(); len(got) != 0 {
++		t.Fatal("expired bindings restored")
++	}
++}
 diff --git a/sdk/cliproxy/auth/selector.go b/sdk/cliproxy/auth/selector.go
-index 24c7656..c391291 100644
+index 24c7656..f789585 100644
 --- a/sdk/cliproxy/auth/selector.go
 +++ b/sdk/cliproxy/auth/selector.go
-@@ -896,12 +896,13 @@ func availabilityBlock(unavailable, quotaExceeded bool, nextRetryAfter, nextReco
+@@ -896,12 +896,14 @@ func availabilityBlock(unavailable, quotaExceeded bool, nextRetryAfter, nextReco
  // It extracts session ID from multiple sources and maintains session-to-auth
  // mappings with automatic failover when the bound auth becomes unavailable.
  type SessionAffinitySelector struct {
@@ -399,6 +822,7 @@ index 24c7656..c391291 100644
 -	subagentAffinity  bool
 -	rebindOnQuotaOnly bool
 -	rebindOnNever     bool
++	disk                *affinityDisk
 +	fallback            Selector
 +	cache               *SessionCache
 +	matcher             *cliproxysession.MerklePrefixMatcher
@@ -409,7 +833,7 @@ index 24c7656..c391291 100644
  }
  
  const (
-@@ -910,6 +911,8 @@ const (
+@@ -910,6 +912,8 @@ const (
  	// SessionAffinityRebindOnQuota preserves the existing session binding across transient failures
  	// and only rebinds on quota, auth, model-support, or permanent unavailability.
  	SessionAffinityRebindOnQuota = "quota"
@@ -418,7 +842,7 @@ index 24c7656..c391291 100644
  	// SessionAffinityRebindOnNever preserves the existing session binding across all failures
  	// and refuses to fail over a bound session to another credential.
  	SessionAffinityRebindOnNever = "never"
-@@ -917,6 +920,8 @@ const (
+@@ -917,6 +921,8 @@ const (
  
  func normalizeSessionAffinityRebindOn(value string) string {
  	switch strings.ToLower(strings.TrimSpace(value)) {
@@ -427,7 +851,7 @@ index 24c7656..c391291 100644
  	case SessionAffinityRebindOnQuota:
  		return SessionAffinityRebindOnQuota
  	case SessionAffinityRebindOnNever:
-@@ -1025,6 +1030,21 @@ func (s *SessionAffinitySelector) shouldPreserveBindingWhenUnavailable(ctx conte
+@@ -1025,6 +1031,21 @@ func (s *SessionAffinitySelector) shouldPreserveBindingWhenUnavailable(ctx conte
  	if s == nil || (!s.rebindOnQuotaOnly && !s.rebindOnNever) || authID == "" {
  		return false
  	}
@@ -449,16 +873,26 @@ index 24c7656..c391291 100644
  	if ctx != nil {
  		if validated, _ := ctx.Value(prevalidatedAuthCandidatesKey{}).(bool); validated {
  			transientAuthIDs := sessionAffinityTransientAuthIDsFromContext(ctx)
-@@ -1087,12 +1107,13 @@ func NewSessionAffinitySelectorWithConfig(cfg SessionAffinityConfig) *SessionAff
+@@ -1059,6 +1080,7 @@ func (s *SessionAffinitySelector) unavailableBoundAuthError(ctx context.Context,
+ 
+ // SessionAffinityConfig configures the session affinity selector.
+ type SessionAffinityConfig struct {
++	StateFile        string
+ 	Fallback         Selector
+ 	TTL              time.Duration
+ 	SubagentAffinity *bool
+@@ -1086,14 +1108,17 @@ func NewSessionAffinitySelectorWithConfig(cfg SessionAffinityConfig) *SessionAff
+ 		subagentAffinity = *cfg.SubagentAffinity
  	}
  	rebindMode := normalizeSessionAffinityRebindOn(cfg.RebindOn)
- 	return &SessionAffinitySelector{
+-	return &SessionAffinitySelector{
 -		fallback:          cfg.Fallback,
 -		cache:             NewSessionCache(cfg.TTL),
 -		matcher:           cliproxysession.NewMerklePrefixMatcher(cfg.TTL),
 -		subagentAffinity:  subagentAffinity,
 -		rebindOnQuotaOnly: rebindMode == SessionAffinityRebindOnQuota,
 -		rebindOnNever:     rebindMode == SessionAffinityRebindOnNever,
++	selector := &SessionAffinitySelector{
 +		fallback:            cfg.Fallback,
 +		cache:               NewSessionCache(cfg.TTL),
 +		matcher:             cliproxysession.NewMerklePrefixMatcher(cfg.TTL),
@@ -467,9 +901,21 @@ index 24c7656..c391291 100644
 +		rebindOnQuotaStrict: rebindMode == SessionAffinityRebindOnQuotaStrict,
 +		rebindOnNever:       rebindMode == SessionAffinityRebindOnNever,
  	}
++	selector.initAffinity(cfg.StateFile, cfg.TTL)
++	return selector
  }
  
-@@ -1231,7 +1252,7 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
+ // Trees returns a backward-compatible in-memory session tree store.
+@@ -1115,7 +1140,7 @@ func (s *SessionAffinitySelector) Trees() *cliproxysession.InMemorySessionTreeSt
+ // Note: The cache key includes provider, session ID, and model to handle cases where
+ // a session uses multiple models (e.g., gemini-2.5-pro and gemini-3-flash-preview)
+ // that may be supported by different auth credentials, and to avoid cross-provider conflicts.
+-func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model string, opts cliproxyexecutor.Options, auths []*Auth) (selected *Auth, errPick error) {
++func (s *SessionAffinitySelector) pickMemory(ctx context.Context, provider, model string, opts cliproxyexecutor.Options, auths []*Auth) (selected *Auth, errPick error) {
+ 	if ctx == nil {
+ 		ctx = context.Background()
+ 	}
+@@ -1231,7 +1256,7 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
  				return s.pickWithAffinityReservation(ctx, provider, model, opts, available, auth, &reservation)
  			}
  		}
@@ -478,7 +924,7 @@ index 24c7656..c391291 100644
  			bind(cachedAuthID, false)
  			errBound := s.unavailableBoundAuthError(ctx, availabilityCandidates, model, cachedAuthID, now)
  			entry.Infof("session-affinity: cache hit but bound auth unavailable, refusing failover | session=%s bound_auth=%s code=%s provider=%s model=%s", truncateSessionID(primaryID), cachedAuthID, errBound.Code, provider, model)
-@@ -1296,7 +1317,7 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
+@@ -1296,7 +1321,7 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
  					}
  				}
  			}
@@ -487,7 +933,7 @@ index 24c7656..c391291 100644
  				bind(cachedAuthID, false)
  				errBound := s.unavailableBoundAuthError(ctx, availabilityCandidates, model, cachedAuthID, now)
  				entry.Infof("session-affinity: fallback cache hit but bound auth unavailable, refusing failover | session=%s fallback=%s bound_auth=%s code=%s provider=%s model=%s", truncateSessionID(primaryID), truncateSessionID(fallbackID), cachedAuthID, errBound.Code, provider, model)
-@@ -1412,7 +1433,7 @@ func (s *SessionAffinitySelector) pickLCP(ctx context.Context, provider, model s
+@@ -1412,7 +1437,7 @@ func (s *SessionAffinitySelector) pickLCP(ctx context.Context, provider, model s
  			picked, errPick := s.pickWithAffinityReservation(ctx, provider, model, opts, available, auth, reservation)
  			return picked, true, errPick
  		}
@@ -496,7 +942,47 @@ index 24c7656..c391291 100644
  			if bindRes := s.matcher.BindFingerprintsWithContext(namespace, fingerprints, tailFingerprints, envDigest, minPrefixLength, match.AuthID); bindRes.SessionID != "" {
  				opts.Metadata[cliproxyexecutor.LCPAffinitySessionIDMetadataKey] = bindRes.SessionID
  				opts.Metadata[cliproxyexecutor.CanonicalSessionIDMetadataKey] = bindRes.SessionID
-@@ -1760,6 +1781,9 @@ func (s *SessionAffinitySelector) OnResult(res Result) {
+@@ -1608,6 +1633,11 @@ func truncateSessionID(id string) string {
+ 
+ // Stop releases resources held by the selector.
+ func (s *SessionAffinitySelector) Stop() {
++	if s != nil && s.disk != nil {
++		s.disk.mu.Lock()
++		defer s.disk.mu.Unlock()
++		s.disk.stopped = true
++	}
+ 	if s == nil {
+ 		return
+ 	}
+@@ -1622,6 +1652,18 @@ func (s *SessionAffinitySelector) Stop() {
+ // InvalidateAuth removes all session bindings for a specific auth.
+ // Called when an auth becomes rate-limited or unavailable.
+ func (s *SessionAffinitySelector) InvalidateAuth(authID string) {
++	if s != nil && s.disk != nil {
++		s.disk.mu.Lock()
++		defer s.disk.mu.Unlock()
++		if s.disk.stopped || s.disk.loadErr != nil {
++			return
++		}
++		defer func() {
++			if s.saveAffinity() != nil {
++				log.Error("proxcli: cannot persist affinity invalidation")
++			}
++		}()
++	}
+ 	if s == nil {
+ 		return
+ 	}
+@@ -1734,7 +1776,7 @@ func (s *SessionAffinitySelector) LookupAffinity(provider, model, sessionID stri
+ }
+ 
+ // OnResult handles session affinity binding or release based on execution outcome.
+-func (s *SessionAffinitySelector) OnResult(res Result) {
++func (s *SessionAffinitySelector) onResultMemory(res Result) {
+ 	if s == nil || res.AuthID == "" {
+ 		return
+ 	}
+@@ -1760,6 +1802,9 @@ func (s *SessionAffinitySelector) OnResult(res Result) {
  		// selected credential is unhealthy, so preserve both explicit and LCP bindings.
  		return
  	}
@@ -506,11 +992,43 @@ index 24c7656..c391291 100644
  	if !res.Success && (s.rebindOnNever || (s.rebindOnQuotaOnly && !shouldRebindSessionAffinityOnError(res.Error))) {
  		// Under session-affinity-rebind-on: never (or quota on transient failures),
  		// keep the session bound to its original credential.
+diff --git a/sdk/cliproxy/proxcli_state_test.go b/sdk/cliproxy/proxcli_state_test.go
+new file mode 100644
+index 0000000..4cfb37a
+--- /dev/null
++++ b/sdk/cliproxy/proxcli_state_test.go
+@@ -0,0 +1,18 @@
++package cliproxy
++
++import (
++	auth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
++	"os"
++	"path/filepath"
++	"testing"
++)
++
++func TestProxCliDurableStateConfigured(t *testing.T) {
++	path := filepath.Join(t.TempDir(), "affinity.enc")
++	t.Setenv("PROXCLI_AFFINITY_FILE", path)
++	selector := newRoutingSelector(routingRuntimeState{sessionAffinity: true, sessionAffinityRebindOn: auth.SessionAffinityRebindOnQuotaStrict})
++	defer selector.(*auth.SessionAffinitySelector).Stop()
++	if _, e := os.Stat(path); e != nil {
++		t.Fatal("core did not enable durable state", e)
++	}
++}
 diff --git a/sdk/cliproxy/service_config.go b/sdk/cliproxy/service_config.go
-index e0e2d8d..0234e16 100644
+index e0e2d8d..ec290b6 100644
 --- a/sdk/cliproxy/service_config.go
 +++ b/sdk/cliproxy/service_config.go
-@@ -94,6 +94,8 @@ func normalizedRoutingRuntimeState(cfg *config.Config) routingRuntimeState {
+@@ -2,6 +2,7 @@ package cliproxy
+ 
+ import (
+ 	"context"
++	"os"
+ 	"strings"
+ 	"time"
+ 
+@@ -94,6 +95,8 @@ func normalizedRoutingRuntimeState(cfg *config.Config) routingRuntimeState {
  	}
  	if state.sessionAffinity {
  		switch strings.ToLower(strings.TrimSpace(cfg.Routing.SessionAffinityRebindOn)) {
@@ -519,3 +1037,69 @@ index e0e2d8d..0234e16 100644
  		case coreauth.SessionAffinityRebindOnQuota:
  			state.sessionAffinityRebindOn = coreauth.SessionAffinityRebindOnQuota
  		case coreauth.SessionAffinityRebindOnNever:
+@@ -115,7 +118,12 @@ func newRoutingSelector(state routingRuntimeState) coreauth.Selector {
+ 	}
+ 	if state.sessionAffinity {
+ 		subagents := state.sessionAffinitySubagents
++		stateFile := ""
++		if state.sessionAffinityRebindOn == coreauth.SessionAffinityRebindOnQuotaStrict {
++			stateFile = os.Getenv("PROXCLI_AFFINITY_FILE")
++		}
+ 		selector = coreauth.NewSessionAffinitySelectorWithConfig(coreauth.SessionAffinityConfig{
++			StateFile:        stateFile,
+ 			Fallback:         selector,
+ 			TTL:              state.sessionAffinityTTL,
+ 			SubagentAffinity: &subagents,
+diff --git a/sdk/cliproxy/session/proxcli_state.go b/sdk/cliproxy/session/proxcli_state.go
+new file mode 100644
+index 0000000..a008bc6
+--- /dev/null
++++ b/sdk/cliproxy/session/proxcli_state.go
+@@ -0,0 +1,47 @@
++package session
++
++import "time"
++
++// Only digests and routing identities, never canonical turns or message text.
++type DurablePrefixBinding struct {
++	Namespace, AuthID, SessionID, ParentSessionID, NodeKind, EnvironmentDigest string
++	MinPrefixLength                                                            int
++	IsFork, IsCompaction                                                       bool
++	Fingerprints, TailFingerprints                                             []string
++	ExpiresAt                                                                  time.Time
++}
++
++func (m *MerklePrefixMatcher) ExportBindings() []DurablePrefixBinding {
++	m.mu.Lock()
++	defer m.mu.Unlock()
++	m.prepareLocked()
++	out := []DurablePrefixBinding{}
++	for e := m.lru.Front(); e != nil; e = e.Next() {
++		g := e.Value.(*lcpGroup)
++		if m.now().Before(g.expiresAt) {
++			out = append(out, DurablePrefixBinding{g.namespace, g.authID, g.sessionID, g.parentSessionID, g.nodeKind, g.environmentDigest, g.minPrefixLength, g.isFork, g.isCompaction, append([]string(nil), g.fingerprints...), append([]string(nil), g.tailFingerprints...), g.expiresAt})
++		}
++	}
++	return out
++}
++func (m *MerklePrefixMatcher) RestoreBindings(items []DurablePrefixBinding) {
++	m.mu.Lock()
++	defer m.mu.Unlock()
++	m.prepareLocked()
++	now := m.now()
++	for _, g := range items {
++		if g.Namespace == "" || g.AuthID == "" || g.SessionID == "" || !now.Before(g.ExpiresAt) || len(g.Fingerprints) == 0 || len(g.Fingerprints) > m.maxTurns || g.MinPrefixLength < 1 || g.MinPrefixLength > len(g.Fingerprints) {
++			continue
++		}
++		expiry := g.ExpiresAt
++		if limit := now.Add(m.ttl); expiry.After(limit) {
++			expiry = limit
++		}
++		key := sequenceKey(g.Fingerprints)
++		ns := m.namespaceLocked(g.Namespace)
++		if old := ns.groups[key]; old != nil {
++			m.removeGroupLocked(old)
++		}
++		m.addGroupLocked(&lcpGroup{key: key, namespace: g.Namespace, authID: g.AuthID, sessionID: g.SessionID, parentSessionID: g.ParentSessionID, nodeKind: g.NodeKind, environmentDigest: g.EnvironmentDigest, minPrefixLength: g.MinPrefixLength, isFork: g.IsFork, isCompaction: g.IsCompaction, fingerprints: append([]string(nil), g.Fingerprints...), tailFingerprints: append([]string(nil), g.TailFingerprints...), expiresAt: expiry})
++	}
++}

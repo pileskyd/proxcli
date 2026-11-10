@@ -5,6 +5,8 @@ import { run } from './run.mjs'
 
 // The patch and its tests apply only to this exact upstream commit.
 const commit = '6db7d4b839d86c5b24e17bbe73bcd4db18ef1b1a'
+// SDK tests must never open an operator's real affinity store from .env.
+delete process.env.PROXCLI_AFFINITY_FILE
 const root = process.cwd()
 const exe = process.platform === 'win32' ? '.exe' : ''
 const temporary = await mkdtemp(join(tmpdir(), 'proxcli-core-build-'))
@@ -16,8 +18,8 @@ try {
   if (await rev.exited !== 0 || actual !== commit) throw new Error('Upstream tag does not match the pinned commit')
   await run(['git', 'apply', '--check', resolve('patches/cliproxyapi-v8.0.63-quota-strict.patch')], source)
   await run(['git', 'apply', resolve('patches/cliproxyapi-v8.0.63-quota-strict.patch')], source)
-  await run(['go', 'test', './sdk/cliproxy/auth', '-count=1'], source)
-  await run(['go', 'test', './sdk/cliproxy', '-run', 'TestServiceApplyConfigRuntimeSessionAffinityRebindOnChangeRecreatesSelector', '-count=1'], source)
+  await run(['go', 'test', './sdk/cliproxy/auth', './sdk/cliproxy/session', '-count=1'], source)
+  await run(['go', 'test', './sdk/cliproxy', '-run', 'TestServiceApplyConfigRuntimeSessionAffinityRebindOnChangeRecreatesSelector|TestProxCliDurableStateConfigured', '-count=1'], source)
   // Generic Go c-shared fixture plugins do not use ProxCli's Intel TLS isolation.
   // Test the supported observer path there; retain the full native-loader suite elsewhere.
   const loaderTests = process.platform === 'darwin' && process.arch === 'x64'

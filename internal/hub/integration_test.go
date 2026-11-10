@@ -53,7 +53,7 @@ func TestCLIProxyAPIIntegration(t *testing.T) {
 	}
 	cmd := exec.Command(binary, "-config", configPath)
 	cmd.Dir = dir
-	cmd.Env = append(os.Environ(), "HTTP_PROXY=", "HTTPS_PROXY=", "ALL_PROXY=", "http_proxy=", "https_proxy=", "all_proxy=", "PROXCLI_DATA_DIR="+filepath.Join(dir, "panel"))
+	cmd.Env = append(os.Environ(), "HTTP_PROXY=", "HTTPS_PROXY=", "ALL_PROXY=", "http_proxy=", "https_proxy=", "all_proxy=", "PROXCLI_DATA_DIR="+filepath.Join(dir, "panel"), "PROXCLI_AFFINITY_FILE="+filepath.Join(dir, "affinity.enc"))
 	// Capture only this isolated fixture's startup; never print OAuth-flow logs.
 	var startup bytes.Buffer
 	cmd.Stdout, cmd.Stderr = &startup, &startup
@@ -140,6 +140,9 @@ func TestCLIProxyAPIIntegration(t *testing.T) {
 		t.Fatalf("expected pending OAuth: %s", w.Body.String())
 	}
 	if os.Getenv("PROXCLI_TEST_POLICY") == "true" {
+		if _, err := os.Stat(filepath.Join(dir, "affinity.enc")); err != nil {
+			t.Fatalf("durable affinity not initialized: %v", err)
+		}
 		requireCode(t, call(t, s, "PATCH", "/api/subscriptions/status", `{"name":"fixture.json","disabled":false}`), 200)
 		files, err := s.credentials(context.Background())
 		if err != nil {

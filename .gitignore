@@ -7,3 +7,6 @@ web/dist/
 dist-release/
 .release-stage/
 *.log
+
+# Local code intelligence index may include machine-specific paths.
+codedb.snapshot

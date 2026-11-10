@@ -54,6 +54,9 @@ func main() {
 			name += ".exe"
 		}
 		child := exec.Command(filepath.Join(filepath.Dir(binary), name), "-config", env("PROXCLI_CORE_CONFIG", ".data/cliproxyapi.yaml"))
+		if os.Getenv("PROXCLI_AFFINITY_FILE") == "" {
+			child.Env = append(os.Environ(), "PROXCLI_AFFINITY_FILE="+filepath.Join(env("PROXCLI_DATA_DIR", ".data"), "affinity.enc"))
+		}
 		child.Stdin = os.Stdin
 		child.Stdout = os.Stdout
 		child.Stderr = os.Stderr

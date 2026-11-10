@@ -1,7 +1,7 @@
 import { access, cp, mkdir, mkdtemp, rm } from 'node:fs/promises'
 import { join, resolve } from 'node:path'
 import { run } from './run.mjs'
-const version = process.env.PROXCLI_VERSION ?? 'v0.2.0'
+const version = process.env.PROXCLI_VERSION ?? 'v0.3.0'
 if (!/^v\d+\.\d+\.\d+(?:-[a-zA-Z0-9.-]+)?$/.test(version)) throw new Error('Invalid release version')
 const os = { darwin: 'macos', linux: 'linux', win32: 'windows' }[process.platform]
 const arch = { x64: 'amd64', arm64: 'arm64' }[process.arch]
