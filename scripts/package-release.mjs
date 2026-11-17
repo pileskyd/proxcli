@@ -1,7 +1,7 @@
 import { access, cp, mkdir, mkdtemp, rm } from 'node:fs/promises'
 import { join, resolve } from 'node:path'
 import { run } from './run.mjs'
-const version = process.env.PROXCLI_VERSION ?? 'v0.3.0'
+const version = process.env.PROXCLI_VERSION ?? 'v0.3.1'
 if (!/^v\d+\.\d+\.\d+(?:-[a-zA-Z0-9.-]+)?$/.test(version)) throw new Error('Invalid release version')
 const os = { darwin: 'macos', linux: 'linux', win32: 'windows' }[process.platform]
 const arch = { x64: 'amd64', arm64: 'arm64' }[process.arch]
@@ -19,7 +19,7 @@ await access('web/dist/index.html')
 await mkdir(stage, { recursive: true })
 try {
   // Release allowlist. User data, environment files, logs and build checkouts are never copied.
-  for (const path of [`bin/proxcli${exe}`, `bin/cli-proxy-api${exe}`, `bin/plugins/proxcli-usage.${extension}`, 'web/dist', 'web/bun.lock', 'configs', '.env.example', 'patches', 'README.md', 'LICENSE', 'THIRD_PARTY_NOTICES.md', 'licenses', 'docs']) {
+  for (const path of [`bin/proxcli${exe}`, `bin/cli-proxy-api${exe}`, `bin/plugins/proxcli-usage.${extension}`, 'web/dist', 'web/bun.lock', 'configs', '.env.example', 'patches', 'upstream.json', 'README.md', 'LICENSE', 'THIRD_PARTY_NOTICES.md', 'licenses', 'docs']) {
     const target = join(stage, path)
     await mkdir(join(target, '..'), { recursive: true })
     await cp(path, target, { recursive: true })

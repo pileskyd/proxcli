@@ -1,0 +1,5 @@
+{
+  "version": "v8.0.76",
+  "commit": "7df56074b252384d878ec4fca840552c6fb5236e",
+  "patch": "patches/cliproxyapi-v8.0.76-quota-strict.patch"
+}

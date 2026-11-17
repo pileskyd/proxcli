@@ -10,7 +10,7 @@ Vue :5173 / Go :8787 ── Management API ─┘
          └─ .data/state.enc (только маршруты и OAuth-сессии)
 ```
 
-Go backend и observer не требуют сторонних библиотек; сборка ядра использует зависимости CLIProxyAPI. Панель Vue не получает management key и OAuth-токены. Для списка моделей Go использует отдельный клиентский access key. API базируется на CLIProxyAPI v8; глобальный proxy читается через совместимый v0 endpoint. Версия upstream при исследовании: commit `6db7d4b`, релиз smoke-теста v8.0.63.
+Go backend и observer не требуют сторонних библиотек; сборка ядра использует зависимости CLIProxyAPI. Панель Vue не получает management key и OAuth-токены. Для списка моделей Go использует отдельный клиентский access key. API базируется на CLIProxyAPI v8; глобальный proxy читается через совместимый v0 endpoint. Ядро закреплено на CLIProxyAPI v8.0.76, commit `7df56074b252384d878ec4fca840552c6fb5236e`; версия, SHA и путь патча заданы в `upstream.json`.
 
 | Операция | Upstream |
 | --- | --- |

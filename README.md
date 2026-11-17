@@ -25,9 +25,9 @@
 
 ## Отличия от CLIProxyAPI и гайда Theo
 
-ProxCli использует CLIProxyAPI v8.0.63, commit `6db7d4b839d86c5b24e17bbe73bcd4db18ef1b1a`. Перевод протоколов, OAuth, streaming, WebSocket, refresh и исполнение запросов остаются в ядре. Панель не стоит на пути inference. Патч добавляет `quota-strict` и изоляцию вызовов observer на Intel macOS.
+ProxCli использует CLIProxyAPI v8.0.76, commit `7df56074b252384d878ec4fca840552c6fb5236e`. Перевод протоколов, OAuth, streaming, WebSocket, refresh и исполнение запросов остаются в ядре. Панель не стоит на пути inference. Патч добавляет `quota-strict` и изоляцию вызовов observer на Intel macOS.
 
-| | CLIProxyAPI v8.0.63 | Подход Theo / T3 из гайда | ProxCli |
+| | CLIProxyAPI v8.0.76 | Подход Theo / T3 из гайда | ProxCli |
 | --- | --- | --- | --- |
 | Общий пул аккаунтов | Есть | Домашний always-on hub, клиенты через Tailscale | Та же схема, с собственной панелью |
 | Прокси на аккаунт | Уже поддерживается ядром | В гайде отдельные прокси не описаны; акцент на домашнем IP | Редактор на каждую подписку, валидация URL, маскирование пароля, привязка до OAuth |
@@ -107,7 +107,17 @@ bun run build
 bun run start
 ```
 
-Теперь UI и API обслуживает один Go процесс на `:8787`. Ядро запускается отдельно через `bun run hub`. `build:core` клонирует точный upstream commit во временный каталог, проверяет применимость патча, выполняет тесты affinity и собирает `bin/cli-proxy-api` и `bin/plugins/proxcli-usage`. Временный checkout удаляется самим скриптом.
+Теперь UI и API обслуживает один Go процесс на `:8787`. Ядро запускается отдельно через `bun run hub`. `build:core` клонирует точный upstream commit во временный каталог, проверяет применимость патча, выполняет тесты affinity и собирает `bin/cli-proxy-api` и `bin/plugins/proxcli-usage`. Временный checkout удаляется самим скриптом. Версия, commit SHA и путь патча заданы в `upstream.json`.
+
+Workflow `Upstream compatibility` ежедневно и по ручному запуску ищет последний стабильный релиз CLIProxyAPI. Если он новее закреплённого, CI проверяет текущий патч, тесты ядра, native observer и контракт панели на Linux amd64. Конфликты и ошибки дают failed run; версия и результат доступны в GitHub Actions Summary. Автоматической смены версии и публикации нет. Workflow начинает работать после попадания в default branch; уведомления зависят от настроек GitHub Actions.
+
+Для локальной проверки кандидата без замены рабочих бинарей:
+
+```sh
+bun run build:core --upstream v8.0.76 --output-dir /tmp/proxcli-candidate
+```
+
+Флаг `--upstream` предназначен для проверки совместимости: SHA кандидата выводится в лог. Обычный `build:core` всегда проверяет закреплённый SHA. После успешных проверок обновляются `upstream.json`, патч и документация; межплатформенные проверки выполняет release workflow.
 
 ## Настройка
 

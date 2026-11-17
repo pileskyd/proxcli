@@ -1,5 +1,19 @@
 # Проверка
 
+## Обновление CLIProxyAPI до v8.0.76
+
+Проверено 2026-11-18 на macOS arm64, Go 1.27.4 и Bun 1.4.5-canary.1. Закреплён upstream commit `7df56074b252384d878ec4fca840552c6fb5236e`.
+
+- Сборка из чистого upstream: проверка SHA, применение патча, полные auth/session suites, SDK routing/state tests, native loader tests, сборка ядра и observer — успешно.
+- `bun run check`: Go race tests, `go vet`, frontend tests, typecheck и production build — успешно. Новые тесты обнаружения upstream-релизов отдельно проверяют числовой порядок версий, нестабильные/некорректные теги и ошибки GitHub API — успешно.
+- `TestProxCliQuotaStrict` расширен на single/mixed selection для explicit и LCP affinity. Дополнительный тест проверяет квоту, исчерпанную другой сессией во время вызова scheduler, и последующий пересчёт после исключения кандидата — успешно.
+- Native observer C ABI и contract test с настоящим v8.0.76, включённой политикой и observer (панель с race detector) — успешно. Использованы синтетические credentials и отдельные каталоги.
+- `actionlint` v1.7.12 проверил workflows — успешно. Реальный запрос GitHub API определил v8.0.76 как текущий стабильный релиз.
+
+`Check` теперь проверяет закреплённое ядро, observer и контракт панели на PR/push. `Upstream compatibility` проверяет новые стабильные релизы ежедневно и вручную на Linux amd64. Его результаты появятся после запуска в GitHub Actions; локально Linux/Windows/Intel macOS не проверялись. Автоматической смены pin и публикации нет. Платформенную матрицу сохраняет release workflow.
+
+## Предыдущая проверка v8.0.63
+
 Локальная проверка выполнена 2026-11-10 на macOS arm64, Go 1.27.3 и Bun 1.4.4-canary.1.
 
 ## Автоматические проверки

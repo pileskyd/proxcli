@@ -8,6 +8,9 @@ permissions:
 jobs:
   check:
     runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      CGO_ENABLED: '1'
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
@@ -20,3 +23,9 @@ jobs:
         with:
           bun-version: latest
       - run: bun run check
+      - name: Build and test pinned core
+        run: bun run build:core
+      - name: Verify native observer
+        run: python3 scripts/test-plugin.py bin/plugins/proxcli-usage.so
+      - name: Verify panel contract with pinned core
+        run: PROXCLI_TEST_CORE="$PWD/bin/cli-proxy-api" PROXCLI_TEST_PLUGIN="$PWD/bin/plugins/proxcli-usage.so" PROXCLI_TEST_POLICY=true go test ./internal/hub -run TestCLIProxyAPIIntegration -count=1 -v

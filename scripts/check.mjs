@@ -1,4 +1,5 @@
 import { run } from './run.mjs'
+await run(['bun', 'test', './scripts/upstream-release.test.mjs'])
 await run(['bun', 'install', '--frozen-lockfile'], `${process.cwd()}/web`)
 await run(['go', 'test', '-race', './...'])
 await run(['go', 'vet', './...'])

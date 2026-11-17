@@ -1,5 +1,5 @@
 diff --git a/internal/api/server_management_v8.go b/internal/api/server_management_v8.go
-index e73ad89..9920626 100644
+index 2b4dee0..552b174 100644
 --- a/internal/api/server_management_v8.go
 +++ b/internal/api/server_management_v8.go
 @@ -18,6 +18,9 @@ func (s *Server) registerManagementV8Routes() {
@@ -201,35 +201,45 @@ index 160636c..07c7684 100644
  	if errOpen != nil {
  		t.Fatalf("Open() v1 error = %v", errOpen)
 diff --git a/sdk/cliproxy/auth/conductor_selection.go b/sdk/cliproxy/auth/conductor_selection.go
-index cd37a04..be1e79b 100644
+index f101257..ba9489b 100644
 --- a/sdk/cliproxy/auth/conductor_selection.go
 +++ b/sdk/cliproxy/auth/conductor_selection.go
-@@ -2330,6 +2330,7 @@ func (m *Manager) pickNextLegacy(ctx context.Context, provider, model string, op
+@@ -2391,6 +2391,7 @@ func (m *Manager) pickNextLegacy(ctx context.Context, provider, model string, op
  		accountingAuths = fullAvailable
  	}
  	transientAuthIDs := m.transientlyUnavailableSessionAffinityAuthIDs(ctx, selector, affinityCandidates, model, now, opts.Headers)
 +	confirmedQuotaIDs := m.proxcliConfirmedQuotaIDs(selector, affinityCandidates, model, now)
  	m.mu.RUnlock()
  
- 	selected, handled, errPick := m.pickViaPluginScheduler(ctx, pluginScheduler, provider, []string{provider}, model, opts, tried, available)
-@@ -2340,6 +2341,7 @@ func (m *Manager) pickNextLegacy(ctx context.Context, provider, model string, op
- 	if !handled {
+ 	selected, handled, excluded, errPick := m.pickViaPluginScheduler(ctx, pluginScheduler, provider, []string{provider}, model, opts, tried, available)
+@@ -2426,10 +2427,12 @@ func (m *Manager) pickNextLegacy(ctx context.Context, provider, model string, op
+ 				accountingAuths = nil
+ 			}
+ 			transientAuthIDs = m.transientlyUnavailableSessionAffinityAuthIDs(ctx, selector, affinityCandidates, model, now, opts.Headers)
++			confirmedQuotaIDs = m.proxcliConfirmedQuotaIDs(selector, affinityCandidates, model, now)
+ 			m.mu.RUnlock()
+ 		}
  		selectorCtx := selectorContextForAvailableAuths(ctx, selector, model)
  		selectorCtx = withSessionAffinityTransientAuthIDs(selectorCtx, transientAuthIDs)
 +		selectorCtx = context.WithValue(selectorCtx, proxcliConfirmedQuotaAuthIDsKey{}, confirmedQuotaIDs)
  		if accountingAuths != nil {
  			selectorCtx = context.WithValue(selectorCtx, weightedAccountingPoolKey{}, accountingAuths)
  		}
-@@ -2785,6 +2787,7 @@ func (m *Manager) pickNextMixedLegacy(ctx context.Context, providers []string, m
+@@ -2889,6 +2892,7 @@ func (m *Manager) pickNextMixedLegacy(ctx context.Context, providers []string, m
  		accountingAuths = fullAvailable
  	}
  	transientAuthIDs := m.transientlyUnavailableSessionAffinityAuthIDs(ctx, selector, affinityCandidates, model, now, opts.Headers)
 +	confirmedQuotaIDs := m.proxcliConfirmedQuotaIDs(selector, affinityCandidates, model, now)
  	m.mu.RUnlock()
  
- 	selected, handled, errPick := m.pickViaPluginScheduler(ctx, pluginScheduler, "mixed", providers, model, opts, tried, available)
-@@ -2795,6 +2798,7 @@ func (m *Manager) pickNextMixedLegacy(ctx context.Context, providers []string, m
- 	if !handled {
+ 	selected, handled, excluded, errPick := m.pickViaPluginScheduler(ctx, pluginScheduler, "mixed", providers, model, opts, tried, available)
+@@ -2924,10 +2928,12 @@ func (m *Manager) pickNextMixedLegacy(ctx context.Context, providers []string, m
+ 				accountingAuths = nil
+ 			}
+ 			transientAuthIDs = m.transientlyUnavailableSessionAffinityAuthIDs(ctx, selector, affinityCandidates, model, now, opts.Headers)
++			confirmedQuotaIDs = m.proxcliConfirmedQuotaIDs(selector, affinityCandidates, model, now)
+ 			m.mu.RUnlock()
+ 		}
  		selectorCtx := selectorContextForAvailableAuths(ctx, selector, model)
  		selectorCtx = withSessionAffinityTransientAuthIDs(selectorCtx, transientAuthIDs)
 +		selectorCtx = context.WithValue(selectorCtx, proxcliConfirmedQuotaAuthIDsKey{}, confirmedQuotaIDs)
@@ -298,26 +308,28 @@ index 0000000..41ebc37
 +}
 diff --git a/sdk/cliproxy/auth/proxcli_policy_test.go b/sdk/cliproxy/auth/proxcli_policy_test.go
 new file mode 100644
-index 0000000..e114ba7
+index 0000000..3dfc828
 --- /dev/null
 +++ b/sdk/cliproxy/auth/proxcli_policy_test.go
-@@ -0,0 +1,93 @@
+@@ -0,0 +1,159 @@
 +package auth
 +
 +import (
 +	"context"
 +	"net/http"
 +	"path/filepath"
++	"strings"
 +	"testing"
 +	"time"
 +
 +	"github.com/router-for-me/CLIProxyAPI/v8/internal/registry"
 +	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
++	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginapi"
 +	sdktranslator "github.com/router-for-me/CLIProxyAPI/v8/sdk/translator"
 +)
 +
 +func TestProxCliQuotaStrict(t *testing.T) {
-+	for _, mode := range []string{"explicit", "lcp"} {
++	for _, mode := range []string{"explicit", "lcp", "mixed-explicit", "mixed-lcp"} {
 +		for _, tc := range []struct {
 +			name     string
 +			status   int
@@ -346,24 +358,31 @@ index 0000000..e114ba7
 +					t.Cleanup(func() { registry.GetGlobalRegistry().UnregisterClient(a.ID) })
 +				}
 +				makeOpts := func() cliproxyexecutor.Options {
-+					if mode == "lcp" {
++					if strings.HasSuffix(mode, "lcp") {
 +						return cliproxyexecutor.Options{SourceFormat: sdktranslator.FormatOpenAI, OriginalRequest: []byte(`{"messages":[{"role":"user","content":"keep this conversation on its original account"}]}`), Metadata: map[string]any{cliproxyexecutor.CallerScopeMetadataKey: id}}
 +					}
 +					return cliproxyexecutor.Options{Headers: http.Header{"X-Session-Id": []string{id}}, Metadata: map[string]any{cliproxyexecutor.DerivedSessionIDMetadataKey: id}}
 +				}
++				pick := func(ctx context.Context, provider, model string, opts cliproxyexecutor.Options, tried map[string]struct{}) (*Auth, ProviderExecutor, error) {
++					if strings.HasPrefix(mode, "mixed-") {
++						a, executor, _, err := manager.pickNextMixed(ctx, []string{provider}, model, opts, tried)
++						return a, executor, err
++					}
++					return manager.pickNext(ctx, provider, model, opts, tried)
++				}
 +				opts := makeOpts()
-+				a, _, e := manager.pickNext(ctx, provider, model, opts, nil)
++				a, _, e := pick(ctx, provider, model, opts, nil)
 +				if e != nil || a == nil || a.ID != high {
 +					t.Fatalf("cold binding: auth=%v err=%v", a, e)
 +				}
 +				manager.MarkResult(ctx, Result{AuthID: high, Provider: provider, Model: model, Success: true, Options: opts})
 +				opts = makeOpts()
-+				a, _, e = manager.pickNext(ctx, provider, model, opts, nil)
++				a, _, e = pick(ctx, provider, model, opts, nil)
 +				if e != nil || a == nil || a.ID != high {
 +					t.Fatalf("warm binding: auth=%v err=%v", a, e)
 +				}
 +				manager.MarkResult(ctx, Result{AuthID: high, Provider: provider, Model: model, Error: &Error{HTTPStatus: tc.status, Message: tc.message}, Options: opts})
-+				a, _, e = manager.pickNext(ctx, provider, model, makeOpts(), map[string]struct{}{high: {}})
++				a, _, e = pick(ctx, provider, model, makeOpts(), map[string]struct{}{high: {}})
 +				if tc.transfer {
 +					if e != nil || a == nil || a.ID != low {
 +						t.Fatalf("quota must transfer: auth=%v err=%v", a, e)
@@ -375,7 +394,7 @@ index 0000000..e114ba7
 +				}
 +				// Recovery of an account with a higher priority never moves a warm binding.
 +				expireSessionAffinityPriorityModelCooldown(t, manager, high, model)
-+				a, _, e = manager.pickNext(ctx, provider, model, makeOpts(), nil)
++				a, _, e = pick(ctx, provider, model, makeOpts(), nil)
 +				want := high
 +				if tc.transfer {
 +					want = low
@@ -386,13 +405,70 @@ index 0000000..e114ba7
 +				restored := NewSessionAffinitySelectorWithConfig(SessionAffinityConfig{StateFile: statePath, Fallback: &FillFirstSelector{}, TTL: 24 * time.Hour, RebindOn: SessionAffinityRebindOnQuotaStrict})
 +				manager.SetSelector(restored)
 +				defer restored.Stop()
-+				a, _, e = manager.pickNext(ctx, provider, model, makeOpts(), nil)
++				a, _, e = pick(ctx, provider, model, makeOpts(), nil)
 +				if e != nil || a == nil || a.ID != want {
 +					t.Fatalf("restart lost quota policy binding: %v %v want %s", a, e, want)
 +				}
 +
 +			})
 +		}
++	}
++}
++
++// Scheduler exclusions take a second selection snapshot. A quota recorded during
++// the scheduler call must be visible to quota-strict in that refreshed snapshot.
++func TestProxCliQuotaStrictSchedulerExclusionSnapshot(t *testing.T) {
++	for _, mixed := range []bool{false, true} {
++		name := "single"
++		if mixed {
++			name = "mixed"
++		}
++		t.Run(name, func(t *testing.T) {
++			ctx := context.Background()
++			provider, model := "openai", "gpt-proxcli-exclusion-"+name
++			manager := NewManager(nil, nil, nil)
++			affinity := NewSessionAffinitySelectorWithConfig(SessionAffinityConfig{Fallback: &FillFirstSelector{}, TTL: time.Hour, RebindOn: SessionAffinityRebindOnQuotaStrict})
++			defer affinity.Stop()
++			manager.SetSelector(affinity)
++			manager.RegisterExecutor(schedulerTestExecutor{provider: provider})
++			for _, a := range []*Auth{
++				{ID: name + "-high", Provider: provider, Status: StatusActive, Attributes: map[string]string{"priority": "3"}},
++				{ID: name + "-low", Provider: provider, Status: StatusActive, Attributes: map[string]string{"priority": "2"}},
++				{ID: name + "-spare", Provider: provider, Status: StatusActive, Attributes: map[string]string{"priority": "1"}},
++			} {
++				if _, err := manager.Register(WithSkipPersist(ctx), a); err != nil {
++					t.Fatal(err)
++				}
++				registry.GetGlobalRegistry().RegisterClient(a.ID, provider, []*registry.ModelInfo{{ID: model}})
++				t.Cleanup(func() { registry.GetGlobalRegistry().UnregisterClient(a.ID) })
++			}
++			opts := cliproxyexecutor.Options{Headers: http.Header{"X-Session-Id": []string{t.Name()}}, Metadata: map[string]any{cliproxyexecutor.DerivedSessionIDMetadataKey: t.Name()}}
++			pick := func() (*Auth, error) {
++				if mixed {
++					a, _, _, err := manager.pickNextMixed(ctx, []string{provider}, model, opts, nil)
++					return a, err
++				}
++				a, _, err := manager.pickNext(ctx, provider, model, opts, nil)
++				return a, err
++			}
++			a, err := pick()
++			if err != nil || a == nil || a.ID != name+"-high" {
++				t.Fatalf("initial binding: %v %v", a, err)
++			}
++			manager.MarkResult(ctx, Result{AuthID: a.ID, Provider: provider, Model: model, Success: true, Options: opts})
++			scheduler := &fakePluginScheduler{pick: func(context.Context, pluginapi.SchedulerPickRequest) (pluginapi.SchedulerPickResponse, bool, error) {
++				// A different in-flight session exhausts this credential while our
++				// original session remains bound to it.
++				other := cliproxyexecutor.Options{Headers: http.Header{"X-Session-Id": []string{"other-session"}}, Metadata: map[string]any{cliproxyexecutor.DerivedSessionIDMetadataKey: "other-session"}}
++				manager.MarkResult(ctx, Result{AuthID: name + "-high", Provider: provider, Model: model, Error: &Error{HTTPStatus: 429, Message: "usage_limit_reached"}, Options: other})
++				return pluginapi.SchedulerPickResponse{ExcludeCandidates: []string{name + "-spare"}}, false, nil
++			}}
++			manager.SetPluginScheduler(scheduler)
++			a, err = pick()
++			if scheduler.calls != 1 || err != nil || a == nil || a.ID != name+"-low" {
++				t.Fatalf("refreshed quota must transfer binding: calls=%d auth=%v err=%v", scheduler.calls, a, err)
++			}
++		})
 +	}
 +}
 diff --git a/sdk/cliproxy/auth/proxcli_state.go b/sdk/cliproxy/auth/proxcli_state.go
@@ -809,10 +885,10 @@ index 0000000..9d58984
 +	}
 +}
 diff --git a/sdk/cliproxy/auth/selector.go b/sdk/cliproxy/auth/selector.go
-index 24c7656..f789585 100644
+index db7f74f..127ceb4 100644
 --- a/sdk/cliproxy/auth/selector.go
 +++ b/sdk/cliproxy/auth/selector.go
-@@ -896,12 +896,14 @@ func availabilityBlock(unavailable, quotaExceeded bool, nextRetryAfter, nextReco
+@@ -1403,12 +1403,14 @@ func availabilityBlock(unavailable, quotaExceeded bool, nextRetryAfter, nextReco
  // It extracts session ID from multiple sources and maintains session-to-auth
  // mappings with automatic failover when the bound auth becomes unavailable.
  type SessionAffinitySelector struct {
@@ -833,7 +909,7 @@ index 24c7656..f789585 100644
  }
  
  const (
-@@ -910,6 +912,8 @@ const (
+@@ -1417,6 +1419,8 @@ const (
  	// SessionAffinityRebindOnQuota preserves the existing session binding across transient failures
  	// and only rebinds on quota, auth, model-support, or permanent unavailability.
  	SessionAffinityRebindOnQuota = "quota"
@@ -842,7 +918,7 @@ index 24c7656..f789585 100644
  	// SessionAffinityRebindOnNever preserves the existing session binding across all failures
  	// and refuses to fail over a bound session to another credential.
  	SessionAffinityRebindOnNever = "never"
-@@ -917,6 +921,8 @@ const (
+@@ -1424,6 +1428,8 @@ const (
  
  func normalizeSessionAffinityRebindOn(value string) string {
  	switch strings.ToLower(strings.TrimSpace(value)) {
@@ -851,7 +927,7 @@ index 24c7656..f789585 100644
  	case SessionAffinityRebindOnQuota:
  		return SessionAffinityRebindOnQuota
  	case SessionAffinityRebindOnNever:
-@@ -1025,6 +1031,21 @@ func (s *SessionAffinitySelector) shouldPreserveBindingWhenUnavailable(ctx conte
+@@ -1532,6 +1538,21 @@ func (s *SessionAffinitySelector) shouldPreserveBindingWhenUnavailable(ctx conte
  	if s == nil || (!s.rebindOnQuotaOnly && !s.rebindOnNever) || authID == "" {
  		return false
  	}
@@ -873,7 +949,7 @@ index 24c7656..f789585 100644
  	if ctx != nil {
  		if validated, _ := ctx.Value(prevalidatedAuthCandidatesKey{}).(bool); validated {
  			transientAuthIDs := sessionAffinityTransientAuthIDsFromContext(ctx)
-@@ -1059,6 +1080,7 @@ func (s *SessionAffinitySelector) unavailableBoundAuthError(ctx context.Context,
+@@ -1566,6 +1587,7 @@ func (s *SessionAffinitySelector) unavailableBoundAuthError(ctx context.Context,
  
  // SessionAffinityConfig configures the session affinity selector.
  type SessionAffinityConfig struct {
@@ -881,7 +957,7 @@ index 24c7656..f789585 100644
  	Fallback         Selector
  	TTL              time.Duration
  	SubagentAffinity *bool
-@@ -1086,14 +1108,17 @@ func NewSessionAffinitySelectorWithConfig(cfg SessionAffinityConfig) *SessionAff
+@@ -1593,14 +1615,17 @@ func NewSessionAffinitySelectorWithConfig(cfg SessionAffinityConfig) *SessionAff
  		subagentAffinity = *cfg.SubagentAffinity
  	}
  	rebindMode := normalizeSessionAffinityRebindOn(cfg.RebindOn)
@@ -906,7 +982,7 @@ index 24c7656..f789585 100644
  }
  
  // Trees returns a backward-compatible in-memory session tree store.
-@@ -1115,7 +1140,7 @@ func (s *SessionAffinitySelector) Trees() *cliproxysession.InMemorySessionTreeSt
+@@ -1622,7 +1647,7 @@ func (s *SessionAffinitySelector) Trees() *cliproxysession.InMemorySessionTreeSt
  // Note: The cache key includes provider, session ID, and model to handle cases where
  // a session uses multiple models (e.g., gemini-2.5-pro and gemini-3-flash-preview)
  // that may be supported by different auth credentials, and to avoid cross-provider conflicts.
@@ -915,7 +991,7 @@ index 24c7656..f789585 100644
  	if ctx == nil {
  		ctx = context.Background()
  	}
-@@ -1231,7 +1256,7 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
+@@ -1738,7 +1763,7 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
  				return s.pickWithAffinityReservation(ctx, provider, model, opts, available, auth, &reservation)
  			}
  		}
@@ -924,7 +1000,7 @@ index 24c7656..f789585 100644
  			bind(cachedAuthID, false)
  			errBound := s.unavailableBoundAuthError(ctx, availabilityCandidates, model, cachedAuthID, now)
  			entry.Infof("session-affinity: cache hit but bound auth unavailable, refusing failover | session=%s bound_auth=%s code=%s provider=%s model=%s", truncateSessionID(primaryID), cachedAuthID, errBound.Code, provider, model)
-@@ -1296,7 +1321,7 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
+@@ -1803,7 +1828,7 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
  					}
  				}
  			}
@@ -933,7 +1009,7 @@ index 24c7656..f789585 100644
  				bind(cachedAuthID, false)
  				errBound := s.unavailableBoundAuthError(ctx, availabilityCandidates, model, cachedAuthID, now)
  				entry.Infof("session-affinity: fallback cache hit but bound auth unavailable, refusing failover | session=%s fallback=%s bound_auth=%s code=%s provider=%s model=%s", truncateSessionID(primaryID), truncateSessionID(fallbackID), cachedAuthID, errBound.Code, provider, model)
-@@ -1412,7 +1437,7 @@ func (s *SessionAffinitySelector) pickLCP(ctx context.Context, provider, model s
+@@ -1919,7 +1944,7 @@ func (s *SessionAffinitySelector) pickLCP(ctx context.Context, provider, model s
  			picked, errPick := s.pickWithAffinityReservation(ctx, provider, model, opts, available, auth, reservation)
  			return picked, true, errPick
  		}
@@ -942,7 +1018,7 @@ index 24c7656..f789585 100644
  			if bindRes := s.matcher.BindFingerprintsWithContext(namespace, fingerprints, tailFingerprints, envDigest, minPrefixLength, match.AuthID); bindRes.SessionID != "" {
  				opts.Metadata[cliproxyexecutor.LCPAffinitySessionIDMetadataKey] = bindRes.SessionID
  				opts.Metadata[cliproxyexecutor.CanonicalSessionIDMetadataKey] = bindRes.SessionID
-@@ -1608,6 +1633,11 @@ func truncateSessionID(id string) string {
+@@ -2115,6 +2140,11 @@ func truncateSessionID(id string) string {
  
  // Stop releases resources held by the selector.
  func (s *SessionAffinitySelector) Stop() {
@@ -954,7 +1030,7 @@ index 24c7656..f789585 100644
  	if s == nil {
  		return
  	}
-@@ -1622,6 +1652,18 @@ func (s *SessionAffinitySelector) Stop() {
+@@ -2129,6 +2159,18 @@ func (s *SessionAffinitySelector) Stop() {
  // InvalidateAuth removes all session bindings for a specific auth.
  // Called when an auth becomes rate-limited or unavailable.
  func (s *SessionAffinitySelector) InvalidateAuth(authID string) {
@@ -973,7 +1049,7 @@ index 24c7656..f789585 100644
  	if s == nil {
  		return
  	}
-@@ -1734,7 +1776,7 @@ func (s *SessionAffinitySelector) LookupAffinity(provider, model, sessionID stri
+@@ -2265,7 +2307,7 @@ func (s *SessionAffinitySelector) LookupAffinity(provider, model, sessionID stri
  }
  
  // OnResult handles session affinity binding or release based on execution outcome.
@@ -982,7 +1058,7 @@ index 24c7656..f789585 100644
  	if s == nil || res.AuthID == "" {
  		return
  	}
-@@ -1760,6 +1802,9 @@ func (s *SessionAffinitySelector) OnResult(res Result) {
+@@ -2291,6 +2333,9 @@ func (s *SessionAffinitySelector) OnResult(res Result) {
  		// selected credential is unhealthy, so preserve both explicit and LCP bindings.
  		return
  	}
@@ -993,7 +1069,7 @@ index 24c7656..f789585 100644
  		// Under session-affinity-rebind-on: never (or quota on transient failures),
  		// keep the session bound to its original credential.
 diff --git a/sdk/cliproxy/auth/selector_test.go b/sdk/cliproxy/auth/selector_test.go
-index 3767868..f9a720c 100644
+index ac9d823..5949e93 100644
 --- a/sdk/cliproxy/auth/selector_test.go
 +++ b/sdk/cliproxy/auth/selector_test.go
 @@ -2040,38 +2040,34 @@ func TestSessionAffinitySelector_CrossProviderIsolation(t *testing.T) {
@@ -1086,7 +1162,7 @@ index 0000000..4cfb37a
 +	}
 +}
 diff --git a/sdk/cliproxy/service_config.go b/sdk/cliproxy/service_config.go
-index e0e2d8d..ec290b6 100644
+index 880f260..c906eb4 100644
 --- a/sdk/cliproxy/service_config.go
 +++ b/sdk/cliproxy/service_config.go
 @@ -2,6 +2,7 @@ package cliproxy
@@ -1106,7 +1182,7 @@ index e0e2d8d..ec290b6 100644
  		case coreauth.SessionAffinityRebindOnQuota:
  			state.sessionAffinityRebindOn = coreauth.SessionAffinityRebindOnQuota
  		case coreauth.SessionAffinityRebindOnNever:
-@@ -115,7 +118,12 @@ func newRoutingSelector(state routingRuntimeState) coreauth.Selector {
+@@ -123,7 +126,12 @@ func newRoutingSelectorWithExisting(state routingRuntimeState, existing coreauth
  	}
  	if state.sessionAffinity {
  		subagents := state.sessionAffinitySubagents

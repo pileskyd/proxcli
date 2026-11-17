@@ -2,7 +2,7 @@
 
 ProxCli is MIT licensed. Bundled dependencies retain their original licenses.
 
-- CLIProxyAPI v8.0.63, commit `6db7d4b839d86c5b24e17bbe73bcd4db18ef1b1a`, by Router-For.ME and contributors: MIT. The release contains a patched binary; the exact patch is in `patches/cliproxyapi-v8.0.63-quota-strict.patch`. The C ABI adapter follows the upstream plugin examples. License: `licenses/CLIProxyAPI-MIT.txt`.
+- CLIProxyAPI v8.0.76, commit `7df56074b252384d878ec4fca840552c6fb5236e`, by Router-For.ME and contributors: MIT. The release contains a patched binary; the exact patch is in `patches/cliproxyapi-v8.0.76-quota-strict.patch`. The C ABI adapter follows the upstream plugin examples. License: `licenses/CLIProxyAPI-MIT.txt`.
 - Golos Text, distributed through Fontsource: SIL Open Font License, bundled in `licenses/Golos-Text-OFL.txt`.
 - PT Mono, distributed through Fontsource: SIL Open Font License, bundled in `licenses/PT-Mono-OFL.txt`.
 - Vue (MIT; `licenses/Vue-MIT.txt`) and its frontend dependencies are bundled by Vite; their package licenses apply. Dependency versions are recorded in `web/bun.lock`.
